@@ -1,0 +1,209 @@
+# train_redd_s2p_transformer.py
+# S2P+CBAM+Transformer，REDD，训练房屋2-6，测试房屋1
+# 固定阈值（来自 config），无动态选择
+
+import os
+import json
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from pathlib import Path
+from sklearn.metrics import f1_score
+import random
+
+# ========== 强制确定性 ==========
+os.environ['TF_DETERMINISTIC_OPS'] = '1'
+os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+SEED = 2024
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+os.environ['PYTHONHASHSEED'] = str(SEED)
+
+from REDD_Parser import Redd_Parser
+from config import get_args, update_preprocessing_parameters
+from model_structure_s2p_cbam_transformer import create_light_transformer_model
+
+REDD_DATA_ROOT = "./data/REDD"
+OUTPUT_BASE = "./redd_s2p_transformer_2"
+
+WINDOW_SIZE = 480
+STEP = 240
+BATCH_SIZE = 32
+EPOCHS = 50
+LEARNING_RATE = 0.001
+
+APPLIANCES = ['refrigerator', 'washer_dryer', 'microwave', 'dishwaser']
+TRAIN_HOUSES = [2, 3, 4, 5, 6]
+TEST_HOUSES = [1]
+
+# 为每个设备配置过采样参数（如果需要手动指定阈值，可在此添加 'threshold'）
+APPLIANCE_PARAMS = {
+    'refrigerator':   {'pos_ratio': 0.5,  'weight_power': 1.5, 'status_weight': 1.0},
+    'washer_dryer':   {'pos_ratio': 0.55, 'weight_power': 2.0, 'status_weight': 2.0},
+    'microwave':      {'pos_ratio': 0.65, 'weight_power': 2.5, 'status_weight': 3.0},
+    'dishwaser':      {'pos_ratio': 0.5,  'weight_power': 1.5, 'status_weight': 2.0},
+}
+
+def compute_metrics(y_true, y_pred, threshold):
+    mae = np.mean(np.abs(y_true - y_pred))
+    sum_true = np.sum(y_true) + 1e-8
+    nep = np.sum(np.abs(y_true - y_pred)) / sum_true
+    bin_true = (y_true > threshold).astype(int)
+    bin_pred = (y_pred > threshold).astype(int)
+    f1 = f1_score(bin_true, bin_pred, zero_division=0)
+    return {'f1': float(f1), 'mae': float(mae), 'nep': float(nep)}
+
+def get_appliance_params(appliance):
+    # 将 dishwaser 映射为 dishwasher 以读取 config 中的参数
+    if appliance == 'dishwaser':
+        key = 'dishwasher'
+    else:
+        key = appliance
+    args = get_args()
+    args.dataset_code = 'redd_lf'
+    args = update_preprocessing_parameters(args)
+    return args.cutoff[key], args.threshold[key]
+
+def generate_windows(mains, target, window_size, step):
+    mains = mains.flatten()
+    target = target.flatten()
+    half = window_size // 2
+    X, y = [], []
+    for start in range(0, len(mains) - window_size + 1, step):
+        X.append(mains[start:start+window_size])
+        y.append(target[start+half])
+    return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
+
+# 确定性过采样
+def oversample_windows(X, y, target_ratio, threshold, seed=SEED):
+    rng = np.random.RandomState(seed)
+    if target_ratio <= 0 or len(X) == 0:
+        return X, y
+    pos_idx = np.where(y > threshold)[0]
+    neg_idx = np.where(y <= threshold)[0]
+    if len(pos_idx) == 0:
+        return X, y
+    total_neg = len(neg_idx)
+    desired_pos = int(total_neg * target_ratio / (1 - target_ratio))
+    if desired_pos <= len(pos_idx):
+        return X, y
+    dup_count = desired_pos - len(pos_idx)
+    dup_idx = rng.choice(pos_idx, size=dup_count, replace=True)
+    X_rs = np.vstack([X, X[dup_idx]])
+    y_rs = np.concatenate([y, y[dup_idx]])
+    shuffle = rng.permutation(len(X_rs))
+    return X_rs[shuffle], y_rs[shuffle]
+
+def main():
+    output_root = Path(OUTPUT_BASE)
+    output_root.mkdir(parents=True, exist_ok=True)
+    all_results = {}
+
+    for appliance in APPLIANCES:
+        print(f"\n>>>> 处理电器: {appliance} <<<<")
+        max_power, on_threshold = get_appliance_params(appliance)   # 固定阈值来自 config
+        conf = APPLIANCE_PARAMS[appliance]
+
+        # 若想手动覆盖阈值，可在此处修改 on_threshold，例如：
+        # on_threshold = 150.0   # 手动指定
+
+        args = get_args()
+        args.dataset_code = 'redd_lf'
+        args = update_preprocessing_parameters(args)
+        args.redd_location = REDD_DATA_ROOT
+        args.appliance_names = [appliance]
+        args.house_indicies = TRAIN_HOUSES
+        args.sampling = '6s'
+        parser_train = Redd_Parser(args)
+        X_train_raw, y_train_raw = generate_windows(parser_train.x, parser_train.y, WINDOW_SIZE, STEP)
+        print(f"  训练集窗口数: {len(X_train_raw)}")
+
+        split = int(0.85 * len(X_train_raw))
+        X_train, X_val = X_train_raw[:split], X_train_raw[split:]
+        y_train, y_val = y_train_raw[:split], y_train_raw[split:]
+        print(f"  切分后训练集: {len(X_train)}, 验证集: {len(X_val)}")
+
+        args.house_indicies = TEST_HOUSES
+        parser_test = Redd_Parser(args, stats=(parser_train.x_mean, parser_train.x_std))
+        X_test, y_test_true = generate_windows(parser_test.x, parser_test.y, WINDOW_SIZE, STEP)
+        print(f"  测试集窗口数: {len(X_test)}")
+
+        y_train_p = y_train / max_power
+        y_val_p = y_val / max_power
+        y_train_s = (y_train > on_threshold).astype(np.float32)
+        y_val_s = (y_val > on_threshold).astype(np.float32)
+
+        X_train_bal, y_train_bal = oversample_windows(X_train, y_train, conf['pos_ratio'], on_threshold)
+        y_train_p = y_train_bal / max_power
+        y_train_s = (y_train_bal > on_threshold).astype(np.float32)
+
+        pos_count = np.sum(y_train_s == 1)
+        neg_count = np.sum(y_train_s == 0)
+        pos_weight = (neg_count / pos_count) ** conf['weight_power'] if pos_count > 0 else 1.0
+        sample_weight = np.where(y_train_s == 1, pos_weight, 1.0).astype(np.float32)
+        print(f"  正样本数: {pos_count}, 负样本数: {neg_count}, 权重: {pos_weight:.2f}")
+
+        model = create_light_transformer_model(window_size=WINDOW_SIZE, hidden=64)
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE),
+            loss={'power_output': 'mse', 'status_output': 'binary_crossentropy'},
+            loss_weights={'power_output': 1.0, 'status_output': conf['status_weight']},
+            metrics={'power_output': 'mae'}
+        )
+
+        model_dir = output_root / appliance
+        model_dir.mkdir(parents=True, exist_ok=True)
+        model_path = model_dir / "best_model.keras"
+        weight_path = model_dir / "best_weights.weights.keras"
+
+        callbacks = [
+            tf.keras.callbacks.EarlyStopping(patience=15, restore_best_weights=True),
+            tf.keras.callbacks.ModelCheckpoint(str(model_path), save_best_only=True,
+                                               monitor='val_power_output_mae', mode='min'),
+            tf.keras.callbacks.ModelCheckpoint(str(weight_path), save_best_only=True,
+                                               monitor='val_power_output_mae', mode='min', save_weights_only=True)
+        ]
+
+        print("  开始训练...")
+        history = model.fit(
+            X_train_bal,
+            {'power_output': y_train_p, 'status_output': y_train_s},
+            validation_data=(X_val, {'power_output': y_val_p, 'status_output': y_val_s}),
+            batch_size=BATCH_SIZE,
+            epochs=EPOCHS,
+            verbose=2,
+            sample_weight={'power_output': sample_weight},
+            callbacks=callbacks
+        )
+
+        if model_path.exists():
+            model = tf.keras.models.load_model(str(model_path))
+
+        preds = model.predict(X_test, verbose=0)
+        y_pred_power = preds[0].flatten() * max_power
+
+        # 使用固定阈值 on_threshold（即来自 config 的阈值）
+        print(f"  固定阈值: {on_threshold:.2f}W")
+
+        metrics = compute_metrics(y_test_true, y_pred_power, on_threshold)
+        metrics['threshold'] = float(on_threshold)   # 记录使用的阈值
+        all_results[appliance] = metrics
+
+        with open(model_dir / "metrics.json", 'w') as f:
+            json.dump(metrics, f, indent=2)
+        pd.DataFrame(history.history).to_csv(model_dir / "history.csv")
+        print(f"  {appliance}: F1={metrics['f1']:.4f}, MAE={metrics['mae']:.2f}W, NEP={metrics['nep']:.4f}")
+
+    with open(output_root / "summary.json", 'w') as f:
+        json.dump(all_results, f, indent=2)
+
+    print("\n全部完成！结果保存在:", OUTPUT_BASE)
+    for app, met in all_results.items():
+        print(f"{app}: F1={met['f1']:.4f}, MAE={met['mae']:.2f}W, NEP={met['nep']:.4f} (阈值={met['threshold']:.1f}W)")
+
+if __name__ == "__main__":
+    main()
